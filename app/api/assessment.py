@@ -1,85 +1,82 @@
-"""Assessment scoring helpers."""
+"""Assessment-related endpoints."""
 
 from __future__ import annotations
 
+from fastapi import APIRouter, Depends, HTTPException
+
 from app.core.llm_engine import LLMEngine
-from app.models.interview import InterviewDocument
-from app.models.schemas import AssessmentReport, JDData, ResumeData, TranscriptMessage
+from app.core.scoring_engine import ScoringEngine
+from app.dependencies import get_interview_service
+from app.models.assessment import AssessmentDocument
+from app.models.schemas import AssessmentReport
+from app.services.interview_service import InterviewService
+from app.services.report_service import ReportService
+from app.utils.helpers import generate_uuid, utc_now
+
+router = APIRouter(prefix="/api/assessment", tags=["assessment"])
 
 
-def _jaccard_similarity(first: set[str], second: set[str]) -> float:
-    """Compute Jaccard similarity for two sets."""
+async def compute_assessment(interview_service: InterviewService, interview_id: str, report_service: ReportService) -> AssessmentReport:
+    """Compute and persist assessment report for interview."""
 
-    if not first and not second:
-        return 1.0
-    union = first | second
-    if not union:
-        return 0.0
-    return len(first & second) / len(union)
+    interview = await interview_service.get_interview(interview_id)
+    if not interview:
+        raise HTTPException(status_code=404, detail="Interview not found")
 
-
-def calculate_technical_score(jd: JDData, resume: ResumeData, responses: list[str]) -> float:
-    """Calculate technical score from skill overlap and response depth."""
-
-    similarity = _jaccard_similarity(set(jd.skills), set(resume.skills)) * 100
-    response_quality = min(100.0, float(sum(len(item.split()) for item in responses))) / max(1, len(responses) * 20) * 100
-    return round((similarity * 0.6) + (response_quality * 0.4), 2)
-
-
-def calculate_communication_score(responses: list[str]) -> float:
-    """Calculate communication score from answer clarity signals."""
-
-    if not responses:
-        return 0.0
-    llm_engine = LLMEngine()
-    transcript = [
-        TranscriptMessage(role="candidate", text=response, timestamp=__import__("datetime").datetime.now(__import__("datetime").timezone.utc))
-        for response in responses
+    scorer = ScoringEngine()
+    eval_scores = [
+        min(100.0, max(0.0, len(msg.text.split()) * 3.0))
+        for msg in interview.transcript
+        if msg.role == "candidate"
     ]
-    analysis = llm_engine.analyze_communication(transcript)
-    return round((analysis.clarity + analysis.confidence + analysis.conciseness) / 3, 2)
+    skills_match = scorer.calculate_skills_match(interview.jd_required_skills, interview.resume_data.skills)
+    technical = scorer.calculate_technical_score(skills_match, eval_scores)
+    communication = scorer.calculate_communication_score(interview.mode, interview.transcript)
+    problem_solving = scorer.calculate_problem_solving_score(interview.transcript)
+    breakdown = scorer.build_score_breakdown(technical, communication, problem_solving)
+    recommendation = scorer.get_recommendation(breakdown.overall_score)
 
+    summary = LLMEngine().summarize_strengths_weaknesses(interview.transcript, breakdown.model_dump())
 
-def calculate_problem_solving_score(responses: list[str]) -> float:
-    """Calculate problem-solving score using reasoning indicators."""
-
-    keywords = {"edge", "trade-off", "approach", "assumption", "complexity", "test"}
-    if not responses:
-        return 0.0
-    keyword_hits = sum(1 for response in responses if any(keyword in response.lower() for keyword in keywords))
-    return round((keyword_hits / len(responses)) * 100, 2)
-
-
-def generate_assessment_report(interview: InterviewDocument) -> AssessmentReport:
-    """Generate complete assessment report from interview document."""
-
-    jd_tokens = {word.strip(".,").lower() for word in interview.jd.split() if len(word) > 2}
-    jd = JDData(text=interview.jd, skills=sorted({skill for skill in jd_tokens if skill in {"python", "fastapi", "mongodb", "docker", "sql"}}))
-    responses = [msg.text for msg in interview.transcript if msg.role == "candidate"]
-
-    technical = calculate_technical_score(jd=jd, resume=interview.resume_data, responses=responses)
-    communication = calculate_communication_score(responses=responses)
-    problem_solving = calculate_problem_solving_score(responses=responses)
-    overall = round((technical * 0.4) + (communication * 0.3) + (problem_solving * 0.3), 2)
-
-    recommendation = "HIRE" if overall >= 80 else "BACKUP" if overall >= 60 else "NO_HIRE"
-    strengths = ["Technical fundamentals"] if technical >= 60 else []
-    if communication >= 60:
-        strengths.append("Clear communication")
-    weaknesses = [] if problem_solving >= 60 else ["Needs stronger structured problem-solving answers"]
-
-    skills_match = round(_jaccard_similarity(set(jd.skills), set(interview.resume_data.skills)) * 100, 2)
-    return AssessmentReport(
+    report = AssessmentReport(
         interview_id=interview.id,
         candidate_name=interview.candidate_name,
-        overall_score=overall,
-        technical_score=technical,
-        communication_score=communication,
-        problem_solving_score=problem_solving,
+        mode=interview.mode,
+        score_breakdown=breakdown,
         skills_match_percentage=skills_match,
+        strengths=summary.strengths,
+        weaknesses=summary.weaknesses,
         recommendation=recommendation,
-        strengths=strengths,
-        weaknesses=weaknesses,
         transcript=interview.transcript,
         pdf_url="",
     )
+
+    pdf_url = report_service.generate_pdf_report(report)
+    report.pdf_url = pdf_url
+
+    assessment_doc = AssessmentDocument(
+        _id=generate_uuid(),
+        interview_id=interview.id,
+        score_breakdown=breakdown,
+        skills_match_percentage=skills_match,
+        recommendation=recommendation,
+        strengths=summary.strengths,
+        weaknesses=summary.weaknesses,
+        pdf_path=pdf_url,
+        created_at=utc_now(),
+    )
+    await interview_service.store_scores(interview.id, breakdown.model_dump())
+    await interview_service.store_assessment(assessment_doc)
+    await interview_service.finalize_interview(interview.id, pdf_url)
+
+    return report
+
+
+@router.post("/{interview_id}/recompute", response_model=AssessmentReport)
+async def recompute_assessment(
+    interview_id: str,
+    interview_service: InterviewService = Depends(get_interview_service),
+) -> AssessmentReport:
+    """Recompute assessment for one interview."""
+
+    return await compute_assessment(interview_service, interview_id, ReportService())

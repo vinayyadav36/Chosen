@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Voice Interview</title>
+  <link rel="stylesheet" href="/frontend/css/voice.css" />
+</head>
+<body>
+  <main class="voice-layout">
+    <h1>Voice Interview</h1>
+    <p id="status">Connecting...</p>
+    <p id="progress">Question 0/0</p>
+    <button id="mic-btn">Send Sample Audio Chunk</button>
+    <button id="end-btn">End Interview</button>
+    <section id="transcript"></section>
+    <audio id="tts-player" controls></audio>
+  </main>
+  <script src="/frontend/js/voice-interview.js"></script>
+</body>
+</html>

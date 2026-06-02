@@ -1,42 +1,32 @@
-"""Deepgram service adapter for speech-to-text operations."""
+"""Deepgram STT service wrapper."""
 
 from __future__ import annotations
 
 import asyncio
 
-from deepgram import DeepgramClient, FileSource, LiveOptions, PrerecordedOptions
-
-from app.core.config import settings
+from deepgram import DeepgramClient, FileSource, PrerecordedOptions
 
 
 class DeepgramService:
-    """Provides Deepgram transcription methods."""
+    """Encapsulates Deepgram transcription operations."""
 
-    def __init__(self) -> None:
-        """Initialize Deepgram client."""
-
-        self.client = DeepgramClient(api_key=settings.deepgram_api_key)
+    def __init__(self, api_key: str | None) -> None:
+        self._api_key = api_key
+        self._client = DeepgramClient(api_key=api_key) if api_key else None
 
     async def transcribe_audio_chunk(self, audio_chunk: bytes) -> str:
-        """Transcribe one audio chunk and return plain text output."""
+        """Transcribe audio bytes and return text."""
 
-        if settings.deepgram_api_key.startswith("test_"):
-            return audio_chunk.decode("utf-8", errors="ignore")
-
+        if not self._client:
+            return ""
         payload: FileSource = {"buffer": audio_chunk}
         options = PrerecordedOptions(model="nova-2", smart_format=True)
-        response = await asyncio.to_thread(
-            self.client.listen.prerecorded.v("1").transcribe_file,
-            payload,
-            options,
-        )
-        return (
-            response.results.channels[0].alternatives[0].transcript
-            if response and response.results.channels
-            else ""
-        )
-
-    async def create_realtime_connection(self):
-        """Create and return Deepgram realtime connection object."""
-
-        return await asyncio.to_thread(self.client.listen.live.v("1").start, LiveOptions(model="nova-2"))
+        try:
+            response = await asyncio.to_thread(
+                self._client.listen.prerecorded.v("1").transcribe_file,
+                payload,
+                options,
+            )
+            return response.results.channels[0].alternatives[0].transcript or ""
+        except Exception:
+            return ""

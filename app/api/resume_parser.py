@@ -1,101 +1,37 @@
-"""Resume parsing and feature extraction utilities."""
+"""Resume parser helper endpoints and reusable parsing functions."""
 
 from __future__ import annotations
 
-import io
-import re
+from fastapi import APIRouter, Depends, File, UploadFile
 
-import docx
-import PyPDF2
-import spacy
+from app.dependencies import get_resume_service
+from app.models.schemas import ResumeData
+from app.services.resume_service import ResumeService
+from app.utils.validators import validate_resume_file_type
 
-from app.models.schemas import Education, ResumeData
-
-_SKILL_KEYWORDS = {
-    "python",
-    "fastapi",
-    "django",
-    "flask",
-    "mongodb",
-    "postgresql",
-    "aws",
-    "docker",
-    "kubernetes",
-    "langchain",
-    "openai",
-    "javascript",
-    "typescript",
-    "react",
-    "git",
-    "linux",
-    "redis",
-    "sql",
-}
-
-_NLP = spacy.blank("en")
+router = APIRouter(prefix="/api/resume", tags=["resume"])
 
 
-def extract_skills(text: str) -> list[str]:
-    """Extract likely technical skills using keyword matching and NLP tokens."""
+def parse_pdf_resume(file_bytes: bytes, service: ResumeService | None = None) -> ResumeData:
+    """Reusable PDF parsing helper."""
 
-    lowered = text.lower()
-    skills = {skill for skill in _SKILL_KEYWORDS if skill in lowered}
-    skills.update(token.text.lower() for token in _NLP(lowered) if token.text.lower() in _SKILL_KEYWORDS)
-    return sorted(skills)
+    parser = service or ResumeService()
+    return parser.parse_pdf_resume(file_bytes)
 
 
-def _extract_experience_years(text: str) -> float:
-    """Extract years of experience from resume text."""
+def parse_docx_resume(file_bytes: bytes, service: ResumeService | None = None) -> ResumeData:
+    """Reusable DOCX parsing helper."""
 
-    matches = re.findall(r"(\d+(?:\.\d+)?)\+?\s+years?", text, flags=re.IGNORECASE)
-    return max((float(item) for item in matches), default=0.0)
-
-
-def _extract_education(text: str) -> list[Education]:
-    """Extract simple education entries from resume text."""
-
-    entries: list[Education] = []
-    for line in text.splitlines():
-        normalized = line.strip()
-        if any(word in normalized.lower() for word in ["b.tech", "bachelor", "master", "m.tech", "phd"]):
-            entries.append(Education(degree=normalized, institution="Unknown"))
-    return entries
+    parser = service or ResumeService()
+    return parser.parse_docx_resume(file_bytes)
 
 
-def _extract_projects(text: str) -> list[str]:
-    """Extract project-like bullet points from text."""
+@router.post("/parse", response_model=ResumeData)
+async def parse_resume_endpoint(
+    resume: UploadFile = File(...),
+    resume_service: ResumeService = Depends(get_resume_service),
+) -> ResumeData:
+    """Parse uploaded resume into structured data."""
 
-    projects = []
-    for line in text.splitlines():
-        clean = line.strip("- •\t ")
-        if len(clean) > 20 and any(k in clean.lower() for k in ["project", "built", "developed", "implemented"]):
-            projects.append(clean)
-    return projects[:10]
-
-
-def _build_resume_data(text: str) -> ResumeData:
-    """Build ResumeData object from plain text."""
-
-    return ResumeData(
-        skills=extract_skills(text),
-        experience_years=_extract_experience_years(text),
-        education=_extract_education(text),
-        projects=_extract_projects(text),
-        certifications=[line.strip() for line in text.splitlines() if "certif" in line.lower()][:5],
-    )
-
-
-def parse_pdf_resume(file: bytes) -> ResumeData:
-    """Parse PDF resume bytes and extract structured resume data."""
-
-    reader = PyPDF2.PdfReader(io.BytesIO(file))
-    text = "\n".join(page.extract_text() or "" for page in reader.pages)
-    return _build_resume_data(text)
-
-
-def parse_docx_resume(file: bytes) -> ResumeData:
-    """Parse DOCX resume bytes and extract structured resume data."""
-
-    document = docx.Document(io.BytesIO(file))
-    text = "\n".join(paragraph.text for paragraph in document.paragraphs)
-    return _build_resume_data(text)
+    validate_resume_file_type(resume)
+    return await resume_service.parse_resume(resume)

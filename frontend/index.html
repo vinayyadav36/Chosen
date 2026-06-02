@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Hybrid AI Interview</title>
+  <link rel="stylesheet" href="/frontend/css/style.css" />
+</head>
+<body>
+  <main class="container">
+    <h1>Hybrid AI Interview Platform</h1>
+    <form id="start-form">
+      <label>Candidate Name<input type="text" name="candidate_name" required /></label>
+      <label>Interview Mode
+        <select name="mode" required>
+          <option value="text">Text</option>
+          <option value="voice">Voice</option>
+        </select>
+      </label>
+      <label>Job Description<textarea name="jd" rows="7" required></textarea></label>
+      <label>Resume (PDF/DOCX)<input type="file" name="resume" accept=".pdf,.docx" required /></label>
+      <button type="submit">Start Interview</button>
+    </form>
+    <p id="status"></p>
+  </main>
+  <script src="/frontend/js/app.js"></script>
+</body>
+</html>

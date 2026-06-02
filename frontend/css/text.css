@@ -1,0 +1,9 @@
+body { font-family: Arial, sans-serif; background: #eef2f8; margin: 0; }
+.chat-layout { max-width: 800px; margin: 25px auto; background: #fff; border-radius: 12px; padding: 16px; }
+#chat { height: 420px; overflow-y: auto; border: 1px solid #ddd; border-radius: 8px; padding: 12px; margin-bottom: 12px; background: #fafbff; }
+.bubble { max-width: 70%; margin: 8px 0; padding: 10px; border-radius: 12px; }
+.ai { background: #dce8ff; }
+.candidate { background: #d7f5df; margin-left: auto; }
+#chat-form { display: flex; gap: 8px; }
+#message { flex: 1; }
+button { padding: 10px 12px; }
