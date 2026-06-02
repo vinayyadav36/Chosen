@@ -1,73 +1,33 @@
-"""Tests for scoring engine and report service."""
-
-from __future__ import annotations
-
-from datetime import datetime, timezone
-
 from app.core.scoring_engine import ScoringEngine
-from app.models.interview import InterviewDocument
-from app.models.schemas import AssessmentReport, Question, ResumeData, TranscriptMessage
+from app.models.enums import InterviewMode, RecommendationType
+from app.models.schemas import AssessmentReport, TranscriptMessage
 from app.services.report_service import ReportService
+from app.utils.helpers import utc_now
 
 
-def _sample_interview() -> InterviewDocument:
-    return InterviewDocument(
-        _id="test-id",
-        candidate_name="Sam",
-        jd="python fastapi mongodb docker sql",
-        resume_data=ResumeData(
-            skills=["python", "fastapi", "docker"],
-            experience_years=4,
-            education=[],
-            projects=["Built API"],
-            certifications=[],
-        ),
-        questions=[
-            Question(
-                text="Explain async in FastAPI",
-                expected_points=["event loop", "await", "I/O"],
-                difficulty="medium",
-                category="technical",
-            )
-        ],
-        transcript=[
-            TranscriptMessage(role="candidate", text="My approach considers edge cases and testing trade-offs.", timestamp=datetime.now(timezone.utc))
-        ],
-        status="completed",
-        created_at=datetime.now(timezone.utc),
-        completed_at=datetime.now(timezone.utc),
-    )
-
-
-def test_scoring_engine_calculations() -> None:
-    interview = _sample_interview()
-    scores = ScoringEngine().calculate_all_scores(interview)
-    assert 0 <= scores.overall <= 100
-
-
-def test_recommendation_logic() -> None:
+def test_recommendation_thresholds() -> None:
     engine = ScoringEngine()
-    assert engine.get_recommendation(85) == "HIRE"
-    assert engine.get_recommendation(65) == "BACKUP"
-    assert engine.get_recommendation(40) == "NO_HIRE"
+    assert engine.get_recommendation(85) == RecommendationType.HIRE
+    assert engine.get_recommendation(65) == RecommendationType.BACKUP
+    assert engine.get_recommendation(45) == RecommendationType.NO_HIRE
 
 
-def test_report_generation(tmp_path) -> None:
+def test_report_json_structure() -> None:
+    engine = ScoringEngine()
+    breakdown = engine.build_score_breakdown(80, 70, 75)
+    transcript = [TranscriptMessage(role='candidate', text='I used fastapi and mongodb.', timestamp=utc_now(), meta={})]
     report = AssessmentReport(
-        interview_id="test-id",
-        candidate_name="Sam",
-        overall_score=75,
-        technical_score=80,
-        communication_score=70,
-        problem_solving_score=72,
-        skills_match_percentage=66,
-        recommendation="BACKUP",
-        strengths=["technical"],
-        weaknesses=["communication"],
-        transcript=[],
-        pdf_url="",
+        interview_id='id-1',
+        candidate_name='Sam',
+        mode=InterviewMode.TEXT,
+        score_breakdown=breakdown,
+        skills_match_percentage=76.0,
+        strengths=['good architecture'],
+        weaknesses=['limited scale examples'],
+        recommendation=engine.get_recommendation(breakdown.overall_score),
+        transcript=transcript,
+        pdf_url='/reports/id-1.pdf',
     )
-    filepath = tmp_path / "report.pdf"
-    output = ReportService().generate_pdf(report, str(filepath))
-    assert filepath.exists()
-    assert output.endswith("report.pdf")
+    report_json = ReportService().generate_json_report(report)
+    assert report_json['interview_id'] == 'id-1'
+    assert report_json['recommendation'] in {'HIRE', 'BACKUP', 'NO_HIRE'}

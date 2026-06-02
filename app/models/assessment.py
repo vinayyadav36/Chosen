@@ -1,13 +1,26 @@
-"""Assessment data model helpers."""
+"""Assessment storage document model."""
 
-from pydantic import BaseModel
+from __future__ import annotations
+
+from datetime import datetime
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from app.models.enums import RecommendationType
+from app.models.schemas import ScoreBreakdown
 
 
-class AssessmentSummary(BaseModel):
-    """Stored assessment summary values."""
+class AssessmentDocument(BaseModel):
+    """Stored assessment metadata for an interview."""
 
-    technical_score: float
-    communication_score: float
-    problem_solving_score: float
-    overall_score: float
-    recommendation: str
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str = Field(alias="_id")
+    interview_id: str
+    score_breakdown: ScoreBreakdown
+    skills_match_percentage: float
+    recommendation: RecommendationType
+    strengths: list[str]
+    weaknesses: list[str]
+    pdf_path: str | None = None
+    created_at: datetime

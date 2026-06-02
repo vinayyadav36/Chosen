@@ -1,26 +1,31 @@
-"""General utility helper functions."""
+"""General helper utilities."""
 
 from __future__ import annotations
 
 import secrets
 import uuid
-
-from fastapi import UploadFile
+from datetime import datetime, timezone
 
 
 def generate_uuid() -> str:
-    """Generate a random UUID string."""
+    """Generate a UUID string."""
 
     return str(uuid.uuid4())
 
 
 def generate_session_token() -> str:
-    """Generate a secure session token for interviews."""
+    """Generate an interview session token."""
 
     return secrets.token_urlsafe(32)
 
 
-def validate_file_type(file: UploadFile, allowed_types: list[str]) -> bool:
-    """Validate uploaded file content type against allowed values."""
+def utc_now() -> datetime:
+    """Return timezone aware UTC datetime."""
 
-    return file.content_type in allowed_types
+    return datetime.now(timezone.utc)
+
+
+def iso_utc_now() -> str:
+    """Return ISO-8601 UTC timestamp."""
+
+    return utc_now().isoformat()

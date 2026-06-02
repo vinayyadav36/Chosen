@@ -1,4 +1,4 @@
-"""LLM engine for interview generation and analysis."""
+"""LLM-driven question and answer orchestration."""
 
 from __future__ import annotations
 
@@ -6,70 +6,118 @@ from statistics import mean
 
 from langchain_openai import ChatOpenAI
 
-from app.models.schemas import CommunicationAnalysis, Evaluation, Question, ResumeData, TranscriptMessage
+from app.models.enums import InterviewMode, QuestionCategory
+from app.models.schemas import AnswerEvaluation, AssessmentSummary, Question, ResumeData, TranscriptMessage
+from app.utils.helpers import generate_uuid
 
 
 class LLMEngine:
-    """Wraps LLM-powered tasks used by interview workflows."""
+    """Generate questions and evaluate candidate answers."""
 
-    def __init__(self, api_key: str | None = None) -> None:
-        """Initialize ChatOpenAI model client."""
-
+    def __init__(self, api_key: str | None = None, default_question_count: int = 8) -> None:
         self._api_key = api_key
-        self.llm = ChatOpenAI(model="gpt-4o", temperature=0.7, api_key=api_key)
+        self._default_question_count = max(8, min(default_question_count, 10))
+        self._model = ChatOpenAI(model="gpt-4o-mini", api_key=api_key, temperature=0.2) if api_key else None
 
-    def generate_questions(self, jd: str, resume: ResumeData) -> list[Question]:
-        """Generate a balanced set of interview questions."""
+    def generate_questions(self, jd_text: str, resume_data: ResumeData, mode: InterviewMode) -> list[Question]:
+        """Generate an interview question bank from JD and resume."""
 
-        jd_skills = {word.strip(".,") for word in jd.lower().split() if len(word) > 2}
-        resume_skills = set(resume.skills)
-        skill_gaps = sorted([skill for skill in jd_skills if skill in {"python", "fastapi", "mongodb", "docker", "sql"} and skill not in resume_skills])
-        topics = (skill_gaps or sorted(resume_skills) or ["python"])[:5]
+        jd_skills = {token.strip(".,").lower() for token in jd_text.split() if len(token) > 2}
+        gaps = sorted(skill for skill in jd_skills if skill in {"python", "fastapi", "mongodb", "docker", "sql", "redis"} and skill not in set(resume_data.skills))
+        targets = gaps or resume_data.skills or ["problem-solving"]
 
         questions: list[Question] = []
-        for idx, topic in enumerate(topics, start=1):
+        for topic in targets[:5]:
+            prefix = "Could you briefly explain" if mode == InterviewMode.VOICE else "Explain in detail"
             questions.append(
                 Question(
-                    text=f"Q{idx}. Explain how you would use {topic} in this role.",
-                    expected_points=[f"core {topic} concepts", "trade-offs", "real example"],
-                    difficulty="medium",
-                    category="technical",
+                    id=generate_uuid(),
+                    text=f"{prefix} your practical experience with {topic}?",
+                    category=QuestionCategory.TECHNICAL,
+                    expected_points=["context", "implementation", "trade-offs"],
                 )
             )
-        while len(questions) < 8:
+
+        while len(questions) < self._default_question_count:
+            idx = len(questions)
+            category = QuestionCategory.PROBLEM_SOLVING if idx % 2 == 0 else QuestionCategory.COMMUNICATION
+            prompt = (
+                "Walk me through a challenging production issue and how you resolved it."
+                if mode == InterviewMode.VOICE
+                else "Describe a complex production problem you solved, including constraints, alternatives, and measurable results."
+            )
             questions.append(
                 Question(
-                    text=f"Q{len(questions)+1}. Describe a challenging problem you solved and your approach.",
-                    expected_points=["problem framing", "solution steps", "result"],
-                    difficulty="medium",
-                    category="problem_solving" if len(questions) % 2 else "behavioral",
+                    id=generate_uuid(),
+                    text=prompt,
+                    category=category,
+                    expected_points=["structure", "reasoning", "outcome"],
                 )
             )
         return questions[:10]
 
-    def evaluate_answer(self, question: Question, answer: str) -> Evaluation:
-        """Evaluate answer quality against expected points."""
+    def evaluate_answer(self, question: Question, answer: str, mode: InterviewMode) -> AnswerEvaluation:
+        """Evaluate candidate answer quality."""
 
-        answer_lower = answer.lower()
-        hits = sum(1 for point in question.expected_points if any(word in answer_lower for word in point.split()))
-        score = round(min(10.0, (hits / max(1, len(question.expected_points))) * 10), 2)
-        feedback = "Strong answer" if score >= 7 else "Needs more depth and concrete examples"
-        return Evaluation(score=score, feedback=feedback)
+        lowered = answer.lower()
+        hits = sum(1 for p in question.expected_points if any(w in lowered for w in p.split()))
+        length_factor = min(1.0, len(answer.split()) / (35 if mode == InterviewMode.TEXT else 20))
+        technical = round(min(100.0, (hits / max(1, len(question.expected_points))) * 100), 2)
+        communication = round(min(100.0, 55 + (45 * length_factor)), 2)
+        problem_solving = round(min(100.0, technical * 0.6 + communication * 0.4), 2)
+        score = round((technical * 0.4 + communication * 0.3 + problem_solving * 0.3) / 10, 2)
+        needs_follow_up = score < 6.0
+        feedback = "Good answer with clear structure." if score >= 7 else "Needs more depth and concrete examples."
+        return AnswerEvaluation(
+            score=score,
+            feedback=feedback,
+            technical=technical,
+            communication=communication,
+            problem_solving=problem_solving,
+            needs_follow_up=needs_follow_up,
+        )
 
-    def analyze_communication(self, transcript: list[TranscriptMessage]) -> CommunicationAnalysis:
-        """Analyze communication quality from transcript text."""
+    def generate_follow_up(self, question: Question, answer: str, mode: InterviewMode) -> Question | None:
+        """Generate a follow-up question when evaluation indicates gaps."""
+
+        evaluation = self.evaluate_answer(question, answer, mode)
+        if not evaluation.needs_follow_up:
+            return None
+        text = "Can you give one concrete production example and decision trade-off?" if mode == InterviewMode.VOICE else "Please provide a specific production example, design trade-off, and measurable impact for your answer."
+        return Question(
+            id=generate_uuid(),
+            text=text,
+            category=question.category,
+            expected_points=["example", "trade-off", "impact"],
+            difficulty="medium",
+        )
+
+    def summarize_strengths_weaknesses(self, transcript: list[TranscriptMessage], scores: dict[str, float]) -> AssessmentSummary:
+        """Create concise strengths and weaknesses summary."""
 
         candidate_messages = [m.text for m in transcript if m.role == "candidate"]
-        if not candidate_messages:
-            return CommunicationAnalysis(clarity=0, confidence=0, conciseness=0, feedback="No candidate responses captured")
+        avg_words = mean([len(msg.split()) for msg in candidate_messages]) if candidate_messages else 0
 
-        lengths = [len(message.split()) for message in candidate_messages]
-        clarity = min(100.0, round(mean(min(1.0, words / 25) for words in lengths) * 100, 2))
-        confidence = min(100.0, round(mean(1.0 if len(msg) > 40 else 0.6 for msg in candidate_messages) * 100, 2))
-        conciseness = min(100.0, round(mean(1.0 if words <= 80 else 0.7 for words in lengths) * 100, 2))
-        return CommunicationAnalysis(
-            clarity=clarity,
-            confidence=confidence,
-            conciseness=conciseness,
-            feedback="Communication is clear and reasonably structured" if clarity >= 60 else "Responses should be clearer and more structured",
-        )
+        strengths: list[str] = []
+        weaknesses: list[str] = []
+
+        if scores.get("technical_score", 0) >= 70:
+            strengths.append("Strong technical grounding aligned to job requirements")
+        if scores.get("problem_solving_score", 0) >= 70:
+            strengths.append("Good problem-solving structure and trade-off thinking")
+        if avg_words >= 25:
+            strengths.append("Provides complete and reasonably detailed answers")
+
+        if scores.get("communication_score", 0) < 60:
+            weaknesses.append("Communication clarity and structure need improvement")
+        if scores.get("technical_score", 0) < 60:
+            weaknesses.append("Needs deeper technical examples and implementation detail")
+        if avg_words < 12:
+            weaknesses.append("Answers are often too brief and lack concrete context")
+
+        if not strengths:
+            strengths.append("Consistent participation across interview rounds")
+        if not weaknesses:
+            weaknesses.append("No major weaknesses identified from current transcript")
+
+        return AssessmentSummary(strengths=strengths[:3], weaknesses=weaknesses[:3])

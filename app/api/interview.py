@@ -1,195 +1,227 @@
-"""Interview API endpoints including start, stream, and report."""
+"""Interview routes for start, text mode, voice stream, and report."""
 
 from __future__ import annotations
 
-import asyncio
-from datetime import datetime, timezone
-from pathlib import Path
+import base64
+import json
 
-from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 
-from app.api.assessment import generate_assessment_report
-from app.api.resume_parser import parse_docx_resume, parse_pdf_resume
+from app.api.assessment import compute_assessment
+from app.core.config import get_settings
 from app.core.llm_engine import LLMEngine
-from app.core.scoring_engine import ScoringEngine
+from app.core.text_agent import TextInterviewAgent
+from app.core.voice_agent import VoiceInterviewAgent
+from app.dependencies import get_interview_service, get_jd_service, get_resume_service
+from app.models.enums import InterviewMode, InterviewStatus
 from app.models.interview import InterviewDocument
-from app.models.schemas import InterviewStartResponse, TranscriptMessage
+from app.models.schemas import InterviewStartResponse, TextMessageRequest, TextMessageResponse
 from app.services.deepgram_service import DeepgramService
 from app.services.elevenlabs_service import ElevenLabsService
+from app.services.interview_service import InterviewService
+from app.services.jd_service import JDService
 from app.services.report_service import ReportService
-from app.utils.helpers import generate_session_token, generate_uuid, validate_file_type
+from app.services.resume_service import ResumeService
+from app.services.transcript_service import TranscriptService
+from app.utils.helpers import generate_session_token, generate_uuid, utc_now
+from app.utils.validators import validate_interview_mode, validate_resume_file_type, validate_voice_provider_configuration
 
 router = APIRouter(prefix="/api/interview", tags=["interview"])
 
 
-def _collection(request: Request):
-    """Return interviews collection from app state."""
-
-    return request.app.state.db["interviews"]
-
-
-async def _insert_one(request: Request, payload: dict) -> None:
-    """Insert one interview record."""
-
-    await asyncio.to_thread(_collection(request).insert_one, payload)
-
-
-async def _find_one(request: Request, interview_id: str) -> dict | None:
-    """Find one interview record by ID."""
-
-    return await asyncio.to_thread(_collection(request).find_one, {"_id": interview_id})
-
-
-async def _update_one(request: Request, interview_id: str, update: dict) -> None:
-    """Update one interview record."""
-
-    await asyncio.to_thread(_collection(request).update_one, {"_id": interview_id}, update)
-
-
 @router.post("/start", response_model=InterviewStartResponse)
 async def start_interview(
-    request: Request,
     jd: str = Form(...),
     candidate_name: str = Form(...),
+    mode: str = Form(...),
     resume: UploadFile = File(...),
+    resume_service: ResumeService = Depends(get_resume_service),
+    jd_service: JDService = Depends(get_jd_service),
+    interview_service: InterviewService = Depends(get_interview_service),
 ) -> InterviewStartResponse:
-    """Start a new interview by parsing resume and generating questions."""
+    """Create a new interview session."""
 
-    if not validate_file_type(resume, ["application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"]):
-        raise HTTPException(status_code=400, detail="Unsupported file type. Only PDF and DOCX are accepted.")
+    interview_mode = validate_interview_mode(mode)
+    validate_resume_file_type(resume)
 
-    try:
-        resume_bytes = await resume.read()
-        resume_data = (
-            parse_pdf_resume(resume_bytes)
-            if resume.content_type == "application/pdf"
-            else parse_docx_resume(resume_bytes)
-        )
-        llm_engine = LLMEngine()
-        questions = llm_engine.generate_questions(jd, resume_data)
+    settings = get_settings()
+    if interview_mode == InterviewMode.VOICE:
+        validate_voice_provider_configuration(settings.deepgram_api_key, settings.elevenlabs_api_key)
 
-        interview_id = generate_uuid()
-        interview = InterviewDocument(
-            _id=interview_id,
-            candidate_name=candidate_name,
-            jd=jd,
-            resume_data=resume_data,
-            questions=questions,
-            transcript=[],
-            status="in_progress",
-            created_at=datetime.now(timezone.utc),
-            completed_at=None,
-        )
-        await _insert_one(request, interview.model_dump(by_alias=True, mode="json"))
-        return InterviewStartResponse(
-            interview_id=interview_id,
-            session_token=generate_session_token(),
-            questions_count=len(questions),
-            estimated_duration=f"{max(10, len(questions) * 3)} minutes",
-        )
-    except HTTPException:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=f"Failed to start interview: {exc}") from exc
+    resume_data = await resume_service.parse_resume(resume)
+    normalized_jd = jd_service.normalize_jd(jd)
+    required_skills = jd_service.extract_required_skills(normalized_jd)
+
+    llm = LLMEngine(api_key=settings.openai_api_key, default_question_count=settings.default_question_count)
+    question_bank = llm.generate_questions(normalized_jd, resume_data, interview_mode)
+
+    session = InterviewDocument(
+        _id=generate_uuid(),
+        session_token=generate_session_token(),
+        candidate_name=candidate_name,
+        mode=interview_mode,
+        status=InterviewStatus.CREATED,
+        jd_text=normalized_jd,
+        resume_data=resume_data,
+        jd_required_skills=required_skills,
+        questions=question_bank,
+        current_question_index=0,
+        transcript=[],
+        scores={},
+        report_path=None,
+        created_at=utc_now(),
+        completed_at=None,
+    )
+    await interview_service.create_interview(session)
+
+    return InterviewStartResponse(
+        interview_id=session.id,
+        session_token=session.session_token,
+        mode=session.mode,
+        questions_count=len(question_bank),
+        estimated_duration=f"{max(10, len(question_bank) * 2)} minutes",
+    )
 
 
-@router.websocket("/{interview_id}/stream")
-async def stream_interview(websocket: WebSocket, interview_id: str) -> None:
-    """Handle bidirectional interview streaming via websocket."""
+@router.post("/{interview_id}/text-message", response_model=TextMessageResponse)
+async def text_message(
+    interview_id: str,
+    payload: TextMessageRequest,
+    interview_service: InterviewService = Depends(get_interview_service),
+) -> TextMessageResponse:
+    """Process one text answer and return next question/progress."""
 
-    await websocket.accept()
-    request = Request(scope=websocket.scope)
-    interview_data = await _find_one(request, interview_id)
-    if not interview_data:
-        await websocket.close(code=4404)
-        return
+    interview = await interview_service.get_interview(interview_id)
+    if not interview:
+        raise HTTPException(status_code=404, detail="Interview not found")
+    if interview.mode != InterviewMode.TEXT:
+        raise HTTPException(status_code=400, detail="text-message endpoint supports only text mode")
 
-    interview = InterviewDocument(**interview_data)
-    llm_engine = LLMEngine()
-    stt_service = DeepgramService()
-    tts_service = ElevenLabsService()
-    current_index = 0
+    llm = LLMEngine(api_key=get_settings().openai_api_key)
+    agent = TextInterviewAgent(interview.jd_text, interview.resume_data, llm)
+    transcript_service = TranscriptService()
 
-    try:
-        while True:
-            if current_index >= len(interview.questions):
-                await _update_one(
-                    request,
-                    interview_id,
-                    {"$set": {"status": "completed", "completed_at": datetime.now(timezone.utc).isoformat()}},
-                )
-                await websocket.send_json({"event": "completed"})
-                break
+    # replay current state
+    agent._questions = interview.questions  # noqa: SLF001
+    agent._index = interview.current_question_index  # noqa: SLF001
+    transcript = interview.transcript
+    if agent.current_question() is not None and (not transcript or transcript[-1].role != "interviewer"):
+        transcript_service.append(transcript, "interviewer", agent.current_question().text, {"mode": "text"})
 
-            question = interview.questions[current_index]
-            await websocket.send_json({"event": "question", "text": question.text, "index": current_index})
-            await websocket.send_bytes(await tts_service.generate_speech(question.text))
+    evaluation, next_question, is_complete, question_number, total_questions = agent.process_answer(transcript, payload.message)
 
-            payload = await websocket.receive()
-            if payload.get("type") == "websocket.disconnect":
-                break
+    await interview_service.append_transcript(interview_id, transcript, agent._index)  # noqa: SLF001
+    await interview_service.update_interview_status(interview_id, InterviewStatus.COMPLETED if is_complete else InterviewStatus.IN_PROGRESS)
 
-            answer_text = payload.get("text") or ""
-            if payload.get("bytes"):
-                answer_text = await stt_service.transcribe_audio_chunk(payload["bytes"])
+    if is_complete:
+        await compute_assessment(interview_service, interview_id, ReportService())
 
-            evaluation = llm_engine.evaluate_answer(question, answer_text)
-            candidate_message = TranscriptMessage(
-                role="candidate",
-                text=answer_text,
-                timestamp=datetime.now(timezone.utc),
-            )
-            interviewer_message = TranscriptMessage(
-                role="interviewer",
-                text=question.text,
-                timestamp=datetime.now(timezone.utc),
-            )
-            interview.transcript.extend([interviewer_message, candidate_message])
-            await _update_one(
-                request,
-                interview_id,
-                {
-                    "$set": {
-                        "transcript": [item.model_dump(mode="json") for item in interview.transcript],
-                        "status": "in_progress",
-                    }
-                },
-            )
-            await websocket.send_json(
-                {
-                    "event": "evaluation",
-                    "score": evaluation.score,
-                    "feedback": evaluation.feedback,
-                }
-            )
-            current_index += 1
-    except WebSocketDisconnect:
-        return
-    except Exception:  # noqa: BLE001
-        await websocket.close(code=1011)
+    return TextMessageResponse(
+        question=next_question.text if next_question else None,
+        question_number=question_number,
+        total_questions=total_questions,
+        is_complete=is_complete,
+        evaluation=evaluation,
+    )
 
 
 @router.get("/{interview_id}/report")
-async def get_report(request: Request, interview_id: str) -> dict:
-    """Generate JSON and PDF report for one interview."""
+async def get_report(
+    interview_id: str,
+    interview_service: InterviewService = Depends(get_interview_service),
+):
+    """Return existing report or compute one."""
 
-    data = await _find_one(request, interview_id)
-    if not data:
-        raise HTTPException(status_code=404, detail="Interview not found")
+    assessment = await interview_service.get_assessment_by_interview(interview_id)
+    if assessment:
+        return {
+            "interview_id": assessment.interview_id,
+            "score_breakdown": assessment.score_breakdown.model_dump(),
+            "skills_match_percentage": assessment.skills_match_percentage,
+            "strengths": assessment.strengths,
+            "weaknesses": assessment.weaknesses,
+            "recommendation": assessment.recommendation.value,
+            "pdf_url": assessment.pdf_path,
+        }
 
-    interview = InterviewDocument(**data)
-    scoring_engine = ScoringEngine()
-    score_breakdown = scoring_engine.calculate_all_scores(interview)
+    report = await compute_assessment(interview_service, interview_id, ReportService())
+    return ReportService().generate_json_report(report)
 
-    report = generate_assessment_report(interview)
-    report.overall_score = score_breakdown.overall
-    report.technical_score = score_breakdown.technical
-    report.communication_score = score_breakdown.communication
-    report.problem_solving_score = score_breakdown.problem_solving
-    report.recommendation = scoring_engine.get_recommendation(score_breakdown.overall)
 
-    report_service = ReportService()
-    pdf_path = report_service.generate_pdf(report, str(Path("reports") / f"{interview_id}.pdf"))
-    report.pdf_url = pdf_path
+@router.websocket("/{interview_id}/voice-stream")
+async def voice_stream(websocket: WebSocket, interview_id: str) -> None:
+    """Handle realtime voice interview over WebSocket."""
 
-    return report.model_dump(mode="json")
+    await websocket.accept()
+    service = InterviewService(websocket.app.state.db_manager.db)
+    interview = await service.get_interview(interview_id)
+    if not interview:
+        await websocket.send_json({"type": "status", "state": "interview_not_found"})
+        await websocket.close(code=4404)
+        return
+    if interview.mode != InterviewMode.VOICE:
+        await websocket.send_json({"type": "status", "state": "invalid_mode"})
+        await websocket.close(code=4400)
+        return
+
+    settings = get_settings()
+    stt = DeepgramService(settings.deepgram_api_key)
+    tts = ElevenLabsService(settings.elevenlabs_api_key)
+
+    llm = LLMEngine(api_key=settings.openai_api_key)
+    agent = VoiceInterviewAgent(interview.jd_text, interview.resume_data, llm)
+    agent._questions = interview.questions  # noqa: SLF001
+    agent._index = interview.current_question_index  # noqa: SLF001
+    transcript = interview.transcript
+    transcript_service = TranscriptService()
+
+    current = agent.current_question()
+    if current:
+        transcript_service.append(transcript, "interviewer", current.text, {"mode": "voice"})
+        audio_bytes = await tts.generate_speech(current.text)
+        await websocket.send_json({"type": "question", "text": current.text, "question_number": agent._index + 1, "total_questions": len(agent.questions)})  # noqa: SLF001
+        await websocket.send_json({"type": "audio", "encoding": "base64", "data": base64.b64encode(audio_bytes).decode("utf-8")})
+
+    try:
+        while True:
+            message = await websocket.receive()
+            if message.get("type") == "websocket.disconnect":
+                break
+
+            answer_text = ""
+            if message.get("bytes"):
+                answer_text = await stt.transcribe_audio_chunk(message["bytes"])
+            elif message.get("text"):
+                try:
+                    payload = json.loads(message["text"])
+                    if payload.get("type") in {"ping", "start", "stop"}:
+                        await websocket.send_json({"type": "status", "state": payload.get("type")})
+                        continue
+                    answer_text = payload.get("message", "")
+                except json.JSONDecodeError:
+                    answer_text = message["text"]
+
+            if not answer_text:
+                await websocket.send_json({"type": "status", "state": "listening"})
+                continue
+
+            await websocket.send_json({"type": "transcript", "role": "candidate", "text": answer_text})
+            evaluation, next_question, is_complete, question_number, total_questions = agent.process_transcribed_answer(transcript, answer_text)
+            await service.append_transcript(interview_id, transcript, agent._index)  # noqa: SLF001
+            await websocket.send_json({"type": "status", "state": "processing", "evaluation": evaluation.model_dump()})
+
+            if is_complete:
+                await service.update_interview_status(interview_id, InterviewStatus.COMPLETED)
+                await compute_assessment(service, interview_id, ReportService())
+                await websocket.send_json({"type": "completed"})
+                break
+
+            if next_question:
+                speech = await tts.generate_speech(next_question.text)
+                await websocket.send_json({"type": "question", "text": next_question.text, "question_number": question_number + 1, "total_questions": total_questions})
+                await websocket.send_json({"type": "audio", "encoding": "base64", "data": base64.b64encode(speech).decode("utf-8")})
+                await service.update_interview_status(interview_id, InterviewStatus.IN_PROGRESS)
+    except WebSocketDisconnect:
+        await service.append_transcript(interview_id, transcript, agent._index)  # noqa: SLF001
+    finally:
+        await websocket.close()
